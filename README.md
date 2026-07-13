@@ -44,6 +44,8 @@ You will need to provide implementations of:
 
 `te` opens (or creates) `<filename>` and drops you straight into editing.
 
+On an embedded system you would instead call te\_edit(filename).
+
 ### Editing
 
 - Type to insert text at the cursor.

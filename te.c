@@ -24,6 +24,8 @@
 
 #ifdef CURSES
 #include <ncurses.h>
+#endif
+
 #define VT100_CURSOR_UP       "\e[A"
 #define VT100_CURSOR_DOWN     "\e[B"
 #define VT100_CURSOR_RIGHT    "\e[C"
@@ -39,7 +41,6 @@
 #define CH_FF  0x0c
 #define CH_BS  0x08
 #define CH_DEL 0x7f
-#endif
 
 #ifdef EMBEDDED
 // example includes
@@ -48,9 +49,15 @@
 #include "include/fs.h"
 #endif
 
-#define ROWS 24
-#define COLS 80
-#define CONTENT_ROWS (ROWS - 1)  /* last row is reserved for the status bar */
+#ifndef TE_DEFAULT_ROWS
+#define TE_DEFAULT_ROWS 24  /* used as-is on embedded targets; on Linux this
+                              * is just the fallback if the terminal size
+                              * can't be determined */
+#endif
+#ifndef TE_DEFAULT_COLS
+#define TE_DEFAULT_COLS 80
+#endif
+#define CONTENT_ROWS (te_rows - 1)  /* last row is reserved for the status bar */
 
 #define MODE_MOVE 0
 #define MODE_EDIT 1
@@ -96,6 +103,7 @@ int te_goal_x;  /* remembered column for vim-style sticky vertical movement */
 int scroll_top;
 int hscroll;    /* horizontal scroll offset, keeps the cursor visible on long lines */
 int f_lines;
+int te_rows, te_cols;  /* screen size: detected on Linux, hardcoded on embedded */
 
 char *te_filename;
 te_lines_t *lines;
@@ -134,6 +142,18 @@ void te_init(void) {
 	initscr();
 	noecho();
 	refresh();
+
+	/* on Linux, get the real terminal size from ncurses instead of
+	 * hardcoding it -- LINES/COLS are populated by initscr() */
+	te_rows = LINES;
+	te_cols = COLS;
+	if (te_rows <= 0) te_rows = TE_DEFAULT_ROWS;
+	if (te_cols <= 0) te_cols = TE_DEFAULT_COLS;
+#else
+	/* embedded targets have no way to query terminal size, so it's
+	 * fixed at compile time */
+	te_rows = TE_DEFAULT_ROWS;
+	te_cols = TE_DEFAULT_COLS;
 #endif
 
 	te_curs_x = 0;
@@ -145,7 +165,7 @@ void te_init(void) {
 }
 
 void te_status(char *notice) {
-	printf(VT100_CURSOR_MOVE_TO, 24, 0);
+	printf(VT100_CURSOR_MOVE_TO, te_rows, 0);
 	printf(VT100_ERASE_LINE);
 	printf("te %s l%i s%i x%i y%i %s", te_filename, f_lines, state, te_curs_x, te_curs_y, notice);
 	printf(VT100_CURSOR_MOVE_TO, (te_curs_y - scroll_top) + 1, (te_curs_x - hscroll) + 1);
@@ -155,6 +175,36 @@ void te_status(char *notice) {
 int te_yield(void) {
 
 	int c = getch();
+
+#ifdef CURSES
+	/* the terminal may have just been resized -- ncurses catches
+	 * SIGWINCH and updates LINES/COLS internally, and getch() reports
+	 * it by returning KEY_RESIZE (rather than a real keystroke) once
+	 * unblocked. We cache our own copy of the size, so re-sync it here
+	 * and repaint if it changed. This also covers the case where a
+	 * real keystroke arrives right after a resize that was already
+	 * applied silently, without an explicit KEY_RESIZE. */
+	{
+		int new_rows = (LINES > 0) ? LINES : TE_DEFAULT_ROWS;
+		int new_cols = (COLS > 0) ? COLS : TE_DEFAULT_COLS;
+		if (new_rows != te_rows || new_cols != te_cols) {
+			te_rows = new_rows;
+			te_cols = new_cols;
+			/* ncurses queues its own resize-triggered screen sync in
+			 * its own output buffer, separate from our raw stdio
+			 * writes -- flush it now, before our redraw, or it can
+			 * land afterward and blank the screen out again */
+			refresh();
+			te_redraw();
+			te_status("");
+		}
+	}
+
+	/* KEY_RESIZE is not a real keystroke -- consume it here so it can
+	 * never fall through and get inserted as text */
+	if (c == KEY_RESIZE) return 1;
+#endif
+
 	if (c == EOF || c == 0) return 1;
 
 	switch(c) {
@@ -395,7 +445,7 @@ int te_yield(void) {
 
 		int old_hscroll = hscroll;
 		if (te_curs_x < hscroll) hscroll = te_curs_x;
-		if (te_curs_x > hscroll + COLS - 1) hscroll = te_curs_x - COLS + 1;
+		if (te_curs_x > hscroll + te_cols - 1) hscroll = te_curs_x - te_cols + 1;
 		if (hscroll < 0) hscroll = 0;
 
 		if (scroll_top != old_scroll || hscroll != old_hscroll) te_redraw();
@@ -423,7 +473,7 @@ void te_redraw() {
 			int len = strlen(ptr->text);
 			int start = (hscroll < len) ? hscroll : len;
 			int outlen = len - start;
-			if (outlen > COLS) outlen = COLS;
+			if (outlen > te_cols) outlen = te_cols;
 			printf("%.*s\n", outlen, ptr->text + start);
 		}
 

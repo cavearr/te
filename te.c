@@ -43,10 +43,7 @@
 #define CH_DEL 0x7f
 
 #ifdef EMBEDDED
-// example includes
-#include "../common/zucker.h"
-#include "include/te.h"
-#include "include/fs.h"
+#include "fs.h"
 #endif
 
 #ifndef TE_DEFAULT_ROWS
@@ -94,26 +91,34 @@ typedef struct te_line_t {
 	struct te_line_t *next;
 } te_line_t;
 
-int mode = MODE_MOVE;
-int state = STATE_NONE;
-int esc_num = 0;  /* numeric parameter accumulated in STATE_ESC2 / STATE_CMD_NUM */
+static int mode = MODE_MOVE;
+static int state = STATE_NONE;
+static int esc_num = 0;  /* numeric parameter accumulated in STATE_ESC2 / STATE_CMD_NUM */
 
 int te_curs_x, te_curs_y;
-int te_goal_x;  /* remembered column for vim-style sticky vertical movement */
-int scroll_top;
-int hscroll;    /* horizontal scroll offset, keeps the cursor visible on long lines */
-int f_lines;
+static int te_goal_x;  /* remembered column for vim-style sticky vertical movement */
+static int scroll_top;
+static int hscroll;    /* horizontal scroll offset, keeps the cursor visible on long lines */
+static int f_lines;
 int te_rows, te_cols;  /* screen size: detected on Linux, hardcoded on embedded */
 
-char *te_filename;
-te_lines_t *lines;
+static char *te_filename;
+static te_lines_t *lines;
 
 void te_edit(char *filename) {
 	te_filename = filename;
 	te_init();
 	if (!te_load()) {
+#ifdef EMBEDDED
+		// no OS to exit(0) to on bare-metal firmware -- that would
+		// take the whole device down, not just this editor session.
+		// Return to the caller (the CLI) instead, same as any other
+		// graceful abort elsewhere in this firmware.
+		printf("unable to load file %s\r\n", te_filename);
+#else
 		printf("unable to load file %s\n", te_filename);
 		exit(0);
+#endif
 	} else {
 		te_redraw();
 		te_status("");
@@ -682,6 +687,7 @@ int te_load(void) {
 		// example load
 		fs = fs_size(te_filename);
 		buf = fs_mallocfile(te_filename);
+		if (buf == NULL && fs > 0) return 0;
 #else
 		FILE *f = fopen(te_filename, "rb");
 		if (f == NULL) return 0;

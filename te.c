@@ -56,6 +56,57 @@
 #endif
 #define CONTENT_ROWS (te_rows - 1)  /* last row is reserved for the status bar */
 
+/*
+ * -DTE_HOST_IO -- optional I/O indirection, off by default (every
+ * existing build -- -DCURSES, plain -DEMBEDDED -- is completely
+ * unaffected unless this is also defined).
+ *
+ * Why this exists: te.c's default embedded contract (README.md,
+ * "Embedded targets") talks to a single global getch()/stdout, which
+ * is the right assumption for a target that's ENTIRELY this editor.
+ * It's the wrong assumption for a caller that's multiplexing more
+ * than one input/output stream through one process -- e.g. Zeitlos's
+ * `repl` app (sw/apps/repl/repl.c), one process serving several
+ * `term` connections at once over a shared port protocol
+ * (sw/common/zport.h). Under TE_HOST_IO, every place this file would
+ * otherwise call getch()/printf()/fflush(stdout) goes through
+ * te_host_getch()/te_host_write()/te_host_flush() instead (declared
+ * in te_host_io.h, NOT provided by this file -- the host app
+ * implements them; see Zeitlos's sw/apps/repl/te_bridge.c for that
+ * side). Every other call site in this file (STATE_ESC0/ESC1/etc's
+ * own logic, the document/line-list functions, te_load()/te_save())
+ * is untouched -- this only changes where bytes actually come from
+ * and go to.
+ */
+#ifdef TE_HOST_IO
+#include "te_host_io.h"
+#include <stdarg.h>
+#define TE_GETCH()      te_host_getch()
+#define TE_FLUSH()      te_host_flush()
+// vsnprintf's into a small stack buffer, then hands the formatted
+// bytes to te_host_write() -- te.c's own printf() call sites here are
+// all short (a VT100 escape sequence, a status line, one line's worth
+// of document text up to te_cols) so this stays comfortably inside
+// TE_PRINTF_BUFSIZE; truncates defensively (vsnprintf's own contract)
+// rather than overrunning if that's ever not true.
+#define TE_PRINTF_BUFSIZE 512
+static void te_printf(const char *fmt, ...) {
+	char buf[TE_PRINTF_BUFSIZE];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	if (n <= 0) return;
+	if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+	te_host_write(buf, n);
+}
+#define TE_PRINTF(...) te_printf(__VA_ARGS__)
+#else
+#define TE_GETCH()      getch()
+#define TE_FLUSH()      fflush(stdout)
+#define TE_PRINTF(...)  printf(__VA_ARGS__)
+#endif
+
 #define MODE_MOVE 0
 #define MODE_EDIT 1
 
@@ -68,8 +119,11 @@
 
 void te_init(void);
 void te_redraw(void);
+void te_redraw_line(int line);	// see its own comment, below
 void te_status(char *notice);
+void te_status_bar(int enabled);	// see its own comment, below
 int te_yield(void);
+int te_edit_start(char *filename);	// see its own comment, below
 
 void te_insert(int l, int pos, char c);
 void te_insert_line(int line);
@@ -95,6 +149,20 @@ static int mode = MODE_MOVE;
 static int state = STATE_NONE;
 static int esc_num = 0;  /* numeric parameter accumulated in STATE_ESC2 / STATE_CMD_NUM */
 
+// whether te_status()'s line count/input-state/cursor-position
+// counters (l%i s%i x%i y%i) are shown -- on by default, so every
+// existing caller (desktop, or an embedded target that never calls
+// this) sees exactly the same status line as before. A caller with
+// its own reason to want the shorter line (te_status_bar(0)) --
+// e.g. Zeitlos's `repl` app, see its own te_bridge.c -- can turn it
+// off; te_status() still always shows the filename and any notice
+// ("SAVED"/"FAILED") either way.
+static int te_status_bar_coords = 1;
+
+void te_status_bar(int enabled) {
+	te_status_bar_coords = enabled;
+}
+
 int te_curs_x, te_curs_y;
 static int te_goal_x;  /* remembered column for vim-style sticky vertical movement */
 static int scroll_top;
@@ -105,25 +173,42 @@ int te_rows, te_cols;  /* screen size: detected on Linux, hardcoded on embedded 
 static char *te_filename;
 static te_lines_t *lines;
 
-void te_edit(char *filename) {
+// starts editing `filename` but does NOT run any input loop itself --
+// meant for a caller that drives te_yield() on its own, one byte at a
+// time, from its own event loop (see this file's own TE_HOST_IO
+// comment above, and te's README.md's "cooperative main loop" note
+// on getch()'s contract in that mode). te_edit() below is just this
+// plus the blocking `while(te_yield());` loop, for the ordinary
+// single-purpose-target case where that's exactly what's wanted.
+//
+// returns true if the session is now live and te_yield() should be
+// called for every subsequent input byte -- false if te_load() failed
+// (matches te_load()'s own return convention), in which case the
+// caller should NOT call te_yield() at all.
+int te_edit_start(char *filename) {
 	te_filename = filename;
 	te_init();
-	if (!te_load()) {
+	if (!te_load()) return 0;
+	te_redraw();
+	te_status("");
+	return 1;
+}
+
+void te_edit(char *filename) {
+	if (!te_edit_start(filename)) {
 #ifdef EMBEDDED
 		// no OS to exit(0) to on bare-metal firmware -- that would
 		// take the whole device down, not just this editor session.
 		// Return to the caller (the CLI) instead, same as any other
 		// graceful abort elsewhere in this firmware.
-		printf("unable to load file %s\r\n", te_filename);
+		TE_PRINTF("unable to load file %s\r\n", filename);
 #else
-		printf("unable to load file %s\n", te_filename);
+		printf("unable to load file %s\n", filename);
 		exit(0);
 #endif
-	} else {
-		te_redraw();
-		te_status("");
-		while(te_yield());
+		return;
 	}
+	while(te_yield());
 }
 
 void te_init(void) {
@@ -170,16 +255,20 @@ void te_init(void) {
 }
 
 void te_status(char *notice) {
-	printf(VT100_CURSOR_MOVE_TO, te_rows, 0);
-	printf(VT100_ERASE_LINE);
-	printf("te %s l%i s%i x%i y%i %s", te_filename, f_lines, state, te_curs_x, te_curs_y, notice);
-	printf(VT100_CURSOR_MOVE_TO, (te_curs_y - scroll_top) + 1, (te_curs_x - hscroll) + 1);
-	fflush(stdout);
+	TE_PRINTF(VT100_CURSOR_MOVE_TO, te_rows, 0);
+	TE_PRINTF(VT100_ERASE_LINE);
+	if (te_status_bar_coords) {
+		TE_PRINTF("te %s l%i s%i x%i y%i %s", te_filename, f_lines, state, te_curs_x, te_curs_y, notice);
+	} else {
+		TE_PRINTF("te %s %s", te_filename, notice);
+	}
+	TE_PRINTF(VT100_CURSOR_MOVE_TO, (te_curs_y - scroll_top) + 1, (te_curs_x - hscroll) + 1);
+	TE_FLUSH();
 }
 
 int te_yield(void) {
 
-	int c = getch();
+	int c = TE_GETCH();
 
 #ifdef CURSES
 	/* the terminal may have just been resized -- ncurses catches
@@ -369,7 +458,7 @@ int te_yield(void) {
 					esc_num = c - '0';
 					state = STATE_CMD_NUM;
 				} else {
-					printf("%c", c);
+					TE_PRINTF("%c", c);
 					if (c == 'q') { return(0); }
 					if (c == 'w') {
 						if (te_save()) te_status("SAVED"); else te_status("FAILED");
@@ -402,6 +491,11 @@ int te_yield(void) {
 					if (te_curs_x > 0) {
 						te_curs_x--;
 						te_delete(te_curs_y, te_curs_x);
+						te_goal_x = te_curs_x;
+						// same line, same line count -- see
+						// te_redraw_line()'s own comment on why this
+						// (much cheaper) redraw is correct here.
+						te_redraw_line(te_curs_y);
 					} else if (te_curs_y > 0) {
 						/* at start of line: merge this line into the previous one */
 						int prevlen = te_line_len(te_curs_y - 1);
@@ -409,9 +503,14 @@ int te_yield(void) {
 						f_lines--;
 						te_curs_y--;
 						te_curs_x = prevlen;
+						te_goal_x = te_curs_x;
+						// line count changed -- every row below this
+						// one just shifted up by one, so a partial
+						// redraw isn't enough here.
+						te_redraw();
+					} else {
+						te_goal_x = te_curs_x;
 					}
-					te_goal_x = te_curs_x;
-					te_redraw();
 				} else if (c == CH_LF || c == CH_CR) {
 					/* split the current line at the cursor position */
 					te_split_line(te_curs_y, te_curs_x);
@@ -419,10 +518,14 @@ int te_yield(void) {
 					te_curs_x = 0;
 					te_curs_y++;
 					te_goal_x = te_curs_x;
+					// line count changed -- same reasoning as the
+					// join-line case above.
 					te_redraw();
 				} else {
 					te_insert(te_curs_y, te_curs_x, c);
-					te_redraw();
+					// same line, same line count -- see
+					// te_redraw_line()'s own comment.
+					te_redraw_line(te_curs_y);
 					te_curs_x++;
 					te_goal_x = te_curs_x;
 				}
@@ -468,24 +571,67 @@ void te_redraw() {
 
 	te_line_t *ptr = lines->first;
 
-	printf(VT100_CURSOR_HOME);
-	printf(VT100_ERASE_SCREEN);
+	TE_PRINTF(VT100_CURSOR_HOME);
+	TE_PRINTF(VT100_ERASE_SCREEN);
 
 	while (ptr) {
 
 		if (l >= scroll_top && l < scroll_top + CONTENT_ROWS) {
-			printf(VT100_CURSOR_MOVE_TO, (l - scroll_top) + 1, 1);
+			TE_PRINTF(VT100_CURSOR_MOVE_TO, (l - scroll_top) + 1, 1);
 			int len = strlen(ptr->text);
 			int start = (hscroll < len) ? hscroll : len;
 			int outlen = len - start;
 			if (outlen > te_cols) outlen = te_cols;
-			printf("%.*s\n", outlen, ptr->text + start);
+			TE_PRINTF("%.*s\n", outlen, ptr->text + start);
 		}
 
 		ptr = ptr->next;
 		l++;
 
 	}
+
+}
+
+// redraws just ONE line's content, in place, at whatever screen row
+// it currently maps to under the CURRENT scroll_top/hscroll -- much
+// cheaper than te_redraw()'s own full erase-and-redraw-every-visible-
+// row, and the difference matters: te_redraw() is otherwise called on
+// EVERY plain keystroke (te_yield()'s STATE_NONE branch, below), so
+// typing into a 24-25 row screen sent a full screen's worth of VT100
+// output (every visible line, ~2KB+) per character. Real-world
+// finding (Zeitlos's `repl` app, sw/apps/repl/te_bridge.c, where each
+// of those bytes also costs a heap allocation on the sending
+// process's own tight budget -- see docs/editor.md there): this was
+// the actual, dominant cost behind sluggish typing, not the status
+// line.
+//
+// ONLY correct to call in place of te_redraw() when the edit that
+// just happened didn't change which lines are visible (no scrolling)
+// and didn't change how many lines exist (no line inserted/removed
+// above or at this row) -- te_yield()'s STATE_NONE branch below is
+// the only caller, and only for the two edits that actually meet
+// that bar (a plain character insert, and a same-line backspace); the
+// scroll-adjustment block later in te_yield() still falls back to a
+// full te_redraw() itself if the edit turns out to have moved the
+// cursor out of view after all (a line that just got long enough to
+// need horizontal scroll, for example) -- this function doesn't need
+// to (and doesn't) guard against that case itself.
+void te_redraw_line(int line) {
+
+	if (line < scroll_top || line >= scroll_top + CONTENT_ROWS) return;
+
+	te_line_t *ptr = lines->first;
+	int l = 0;
+	while (ptr && l < line) { ptr = ptr->next; l++; }
+	if (!ptr) return;
+
+	TE_PRINTF(VT100_CURSOR_MOVE_TO, (line - scroll_top) + 1, 1);
+	TE_PRINTF(VT100_ERASE_LINE);
+	int len = strlen(ptr->text);
+	int start = (hscroll < len) ? hscroll : len;
+	int outlen = len - start;
+	if (outlen > te_cols) outlen = te_cols;
+	TE_PRINTF("%.*s", outlen, ptr->text + start);
 
 }
 

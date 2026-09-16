@@ -124,6 +124,7 @@ void te_status(char *notice);
 void te_status_bar(int enabled);	// see its own comment, below
 int te_yield(void);
 int te_edit_start(char *filename);	// see its own comment, below
+void te_edit_end(void);				// free the document; see te_bridge.c
 
 void te_insert(int l, int pos, char c);
 void te_insert_line(int line);
@@ -185,10 +186,33 @@ static te_lines_t *lines;
 // called for every subsequent input byte -- false if te_load() failed
 // (matches te_load()'s own return convention), in which case the
 // caller should NOT call te_yield() at all.
+static void te_free_doc(void) {
+	te_line_t *ptr;
+	if (!lines) return;
+	ptr = lines->first;
+	while (ptr) {
+		te_line_t *next = ptr->next;
+		free(ptr->text);
+		free(ptr);
+		ptr = next;
+	}
+	free(lines);
+	lines = NULL;
+	f_lines = 0;
+}
+
+void te_edit_end(void) {
+	te_free_doc();
+	te_filename = NULL;
+}
+
 int te_edit_start(char *filename) {
 	te_filename = filename;
 	te_init();
-	if (!te_load()) return 0;
+	if (!te_load()) {
+		te_edit_end();
+		return 0;
+	}
 	te_redraw();
 	te_status("");
 	return 1;
@@ -214,6 +238,8 @@ void te_edit(char *filename) {
 void te_init(void) {
 
 	te_line_t *line;
+
+	te_free_doc();
 
 	f_lines = 1;
 
@@ -846,30 +872,45 @@ int te_load(void) {
 #endif
 	}
 
-	int pos = 0;
-	char c;
+	/* One malloc per line, not one per character. The old loop called
+	 * te_insert() for every byte, which calloc'd a new buffer each
+	 * time -- 18KB of RFC text took ~16 s and left the heap too
+	 * fragmented for a second open. */
+	{
+		int start = 0;
+		int first = 1;
+		int i;
 
-	for (int i = 0; i < fs; i++) {
-
-		c = buf[i];
-
-		if (c == '\r') continue;
-
-		if (c == '\n') {
-			pos = 0;
-			/* a newline that's the very last byte of the file just
-			 * terminates the last line -- it shouldn't create a new
-			 * (empty) line after it */
-			if (i != fs - 1) {
-				te_insert_line(f_lines - 1);
-				++f_lines;
+		for (i = 0; i <= fs; i++) {
+			int is_end = (i == fs);
+			int is_nl = (!is_end && buf[i] == '\n');
+			if (!is_end && !is_nl) continue;
+			if (is_end && start == fs) break;	/* trailing newline: no extra line */
+			{
+				int end = i;
+				int len;
+				char *text;
+				te_line_t *ptr;
+				if (end > start && buf[end - 1] == '\r') end--;
+				len = end - start;
+				if (!first) {
+					te_insert_line(f_lines - 1);
+					f_lines++;
+				}
+				first = 0;
+				text = malloc((size_t)len + 1);
+				if (!text) {
+					free(buf);
+					return 0;
+				}
+				if (len) memcpy(text, buf + start, (size_t)len);
+				text[len] = 0;
+				ptr = lines->last;
+				free(ptr->text);
+				ptr->text = text;
 			}
-			continue;
+			start = i + 1;
 		}
-
-		te_insert(f_lines - 1, pos, c);
-		++pos;
-
 	}
 
 	free(buf);
